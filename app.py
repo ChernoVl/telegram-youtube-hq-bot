@@ -7,219 +7,182 @@ from pathlib import Path
 
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-# ========== Config via Environment Variables ==========
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # <-- set this on Railway
-# Optional: change default container tmp dir if needed
-WORK_DIR = os.getenv("WORK_DIR", "/tmp")
+# ---- Config from environment ----
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Set BOT_TOKEN env var with your Telegram bot token")
 
-# Telegram’s hard limit (as of 2025) is 2GB per file for standard bots
-TELEGRAM_MAX_BYTES = 2_000_000_000
+# Max size we will attempt to upload to Telegram (bytes). Telegram hard limit is ~2GB.
+TELEGRAM_MAX_BYTES = int(os.getenv("TELEGRAM_MAX_BYTES", str(1_950_000_000)))
 
-# Simple YouTube URL regex
+# A simple YouTube URL matcher
 YOUTUBE_RE = re.compile(
-    r"(?i)\b(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=[\w\-]+|youtu\.be/[\w\-]+)\S*"
+    r"^(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=[\w-]{11}|youtu\.be/[\w-]{11}).*",
+    re.IGNORECASE,
 )
 
 
-def pick_best_output_file(tmp_dir: Path) -> Path | None:
-    """Pick the merged/remuxed file produced by yt-dlp."""
-    # Prefer .mp4 (remuxed), else mkv
-    mp4s = sorted(tmp_dir.glob("*.mp4"), key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
-    if mp4s:
-        return mp4s[0]
-    mkvs = sorted(tmp_dir.glob("*.mkv"), key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
-    if mkvs:
-        return mkvs[0]
-    # Fallback: any large media file
-    alls = sorted(tmp_dir.glob("*"), key=lambda p: p.stat().st_size if p.is_file() else 0, reverse=True)
-    return alls[0] if alls else None
+def human(n: int) -> str:
+    # human-readable size
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
 
 
-async def run_yt_dlp(url: str, out_dir: Path, prefer_mp4: bool = True, timeout_sec: int = 1800) -> tuple[int, str]:
-    """
-    Run yt-dlp to download highest quality video+audio and merge to one file.
-    Returns (exit_code, combined_stdout_stderr).
-    """
-    # Format note:
-    # - bestvideo*+bestaudio -> DASH separate streams
-    # - --merge-output-format mp4 to force container MP4 (safer for Telegram preview)
-    # - -S sorts by resolution,fps,codec and tries AV1/Vp9 if available, then falls back
-    # - --no-playlist ensures single link behavior
-    # - --concurrent-fragments speeds up
-    # - --restrict-filenames avoids weird chars
-    # - --no-warnings keeps logs tidy (we’ll still capture stderr)
-    fmt = "bestvideo*+bestaudio/best"
-    args = [
-        "yt-dlp",
-        "-f", fmt,
-        "-S", "res:desc,fps:desc,codec:av1,codec:vp9,br:desc",
-        "--no-playlist",
-        "--concurrent-fragments", "5",
-        "--merge-output-format", "mp4" if prefer_mp4 else "mkv",
-        "--remux-video", "mp4" if prefer_mp4 else "mkv",
-        "--restrict-filenames",
-        "-o", "%(title)s.%(ext)s",
-        url,
-    ]
-
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        cwd=str(out_dir),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-
-    try:
-        out = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return (124, "yt-dlp timed out")
-
-    code = proc.returncode
-    text = out[0].decode("utf-8", errors="ignore") if out and out[0] else ""
-    return code, text
-
-
-async def send_safe_edit(message, text: str):
-    """Try to edit a status message; if Telegram times out, just ignore."""
+async def safe_edit(message, text: str):
+    """Edit a message but ignore network timeouts/errors so they don't crash the bot."""
     try:
         await message.edit_text(text)
     except Exception:
-        # Your log showed httpx.ReadTimeout here; not fatal.
+        # swallow httpx.ReadTimeout or any transient Telegram edit failure
         pass
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send me a YouTube link and I’ll fetch the highest quality video I can.")
+    await update.message.reply_text(
+        "Send me a YouTube link and I’ll fetch the highest available quality and send the file back.\n"
+        "Note: Max file size is ~2GB (Telegram limit)."
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.text:
+    text = (update.message.text or "").strip()
+
+    if not YOUTUBE_RE.match(text):
+        await update.message.reply_text("Please send a valid YouTube video URL.")
         return
 
-    # Only respond in private chats (you asked for private only)
-    if msg.chat.type != "private":
-        return
+    # Acknowledge and show progress
+    status = await update.message.reply_text("Analyzing link…")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    match = YOUTUBE_RE.search(msg.text)
-    if not match:
-        await msg.reply_text("Please send a valid YouTube URL.")
-        return
-
-    url = match.group(0)
-
-    # Status message to update throughout (edit can timeout; we swallow those)
-    status = await msg.reply_text("Analyzing link…")
-
-    # Typing / upload action hints (not required, but nice)
-    await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
-
-    # Work directory
-    tmp_root = Path(WORK_DIR)
-    tmp_root.mkdir(parents=True, exist_ok=True)
-    tmp_dir_obj = tempfile.TemporaryDirectory(dir=tmp_root)
-    tmp_dir = Path(tmp_dir_obj.name)
-
-    # Run yt-dlp
-    await send_safe_edit(status, "Downloading the best video + audio…")
-    code, log = await run_yt_dlp(url, tmp_dir, prefer_mp4=True)
-
-    if code != 0:
-        # Common cases: DRM, SABR, signature issues
-        err_note = (
-            "Download failed.\n\n"
-            "• Make sure the video isn’t DRM-protected (Movies/TV often are).\n"
-            "• Some formats may be temporarily unavailable (SABR/‘signature’ warnings).\n"
-            "• Ensure the bot runs a recent yt-dlp build.\n\n"
-            f"yt-dlp log:\n```\n{log[-1500:]}\n```"
-        )
-        try:
-            await status.edit_text(err_note, parse_mode="Markdown")
-        except Exception:
-            await msg.reply_text(err_note, parse_mode="Markdown")
-        tmp_dir_obj.cleanup()
-        return
-
-    # Pick the merged file
-    out_file = pick_best_output_file(tmp_dir)
-    if not out_file or not out_file.exists():
-        try:
-            await status.edit_text("I couldn’t find the merged output file. The video might be protected.")
-        except Exception:
-            await msg.reply_text("I couldn’t find the merged output file. The video might be protected.")
-        tmp_dir_obj.cleanup()
-        return
-
-    size = out_file.stat().st_size
-    if size > TELEGRAM_MAX_BYTES:
-        human_mb = round(size / (1024 * 1024), 1)
-        try:
-            await status.edit_text(
-                f"The file is {human_mb} MB, which exceeds Telegram’s ~2000 MB limit. "
-                "I can’t upload it. Try a lower resolution with a different link."
-            )
-        except Exception:
-            await msg.reply_text(
-                f"The file is {human_mb} MB, which exceeds Telegram’s ~2000 MB limit. "
-                "I can’t upload it. Try a lower resolution with a different link."
-            )
-        tmp_dir_obj.cleanup()
-        return
-
-    await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.UPLOAD_VIDEO)
-    await send_safe_edit(status, "Uploading to Telegram…")
-
-    # Try send_video (gets an inline preview). If that fails, fall back to send_document.
+    # Download in a temp directory
+    tmpdir = Path(tempfile.mkdtemp(prefix="yt_"))
     try:
-        # Use a readable filename (Telegram uses this for downloads)
-        filename = out_file.name
-        with out_file.open("rb") as f:
-            await msg.reply_video(video=f, filename=filename, caption="Here you go 🎬")
-        await send_safe_edit(status, "Done ✅")
-    except Exception:
-        # Some containers or formats won’t preview – use send_document instead
-        try:
-            with out_file.open("rb") as f:
-                await msg.reply_document(document=f, filename=out_file.name, caption="Here you go 🎬")
-            await send_safe_edit(status, "Done ✅")
-        except Exception as e:
-            # Final failure message with tail of yt-dlp logs for troubleshooting
-            err = f"Upload failed: {e}\n\nLog tail:\n```\n{log[-1000:]}\n```"
-            try:
-                await status.edit_text(err, parse_mode="Markdown")
-            except Exception:
-                await msg.reply_text(err, parse_mode="Markdown")
+        file_path = await asyncio.to_thread(download_youtube_best, text, tmpdir)
 
-    # Cleanup
-    try:
-        tmp_dir_obj.cleanup()
-    except Exception:
-        pass
+        if not file_path or not file_path.exists():
+            await safe_edit(status, "Sorry, I couldn’t download that video.")
+            return
+
+        size = file_path.stat().st_size
+        if size > TELEGRAM_MAX_BYTES:
+            await safe_edit(
+                status,
+                f"Downloaded **{file_path.name}** but it’s too large for Telegram ({human(size)} > {human(TELEGRAM_MAX_BYTES)}).",
+            )
+            return
+
+        await safe_edit(status, "Uploading to Telegram…")
+
+        # Prefer send_video if it looks like an MP4; otherwise fall back to document
+        try:
+            if file_path.suffix.lower() == ".mp4":
+                await context.bot.send_video(
+                    chat_id=update.effective_chat.id,
+                    video=file_path.open("rb"),
+                    supports_streaming=True,
+                    caption=f"{file_path.name} ({human(size)})",
+                )
+            else:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=file_path.open("rb"),
+                    caption=f"{file_path.name} ({human(size)})",
+                )
+        finally:
+            # best-effort cleanup message
+            await safe_edit(status, "Done ✅")
+
+    finally:
+        # Clean up temp dir
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def download_youtube_best(url: str, outdir: Path) -> Path | None:
+    """
+    Uses yt-dlp to fetch the highest quality video+audio and output MP4 if possible.
+    Includes extractor args to mitigate current SABR/client issues.
+    """
+    from yt_dlp import YoutubeDL
+
+    outtmpl = str(outdir / "%(id)s.%(ext)s")
+
+    # Try to prioritize a widely compatible MP4 container.
+    # If best streams are non-mp4, remux to mp4 (no re-encode) when possible.
+    ydl_opts = {
+        # Highest quality combo; fall back to single best if needed
+        "format": "bestvideo*+bestaudio/best",
+        # Merge into mp4 when possible (remux; fast, no re-encode)
+        "merge_output_format": "mp4",
+        "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
+        "concurrent_fragment_downloads": 5,
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        # Workarounds for current YT behavior (SABR / missing URLs / signature issues)
+        "extractor_args": {
+            "youtube": {
+                # Prefer android clients which currently avoid SABR more often
+                "player_client": ["android", "android_embedded", "web_creator"],
+            }
+        },
+        # Some hosts are picky about UA
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        },
+    }
+
+    # Do the download
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        # Resolve the actual output filename (after remux)
+        # Prefer the actual file present in outdir with the expected id
+        vid_id = info.get("id")
+        # probe candidates (mp4 first)
+        candidates = list(outdir.glob(f"{vid_id}.mp4")) or list(outdir.glob(f"{vid_id}.*"))
+        return candidates[0] if candidates else None
 
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN env var is required")
-
+    # Build application; set sane timeouts for long polling
     app = (
-        Application.builder()
+        ApplicationBuilder()
         .token(BOT_TOKEN)
-        # Timeouts to reduce ReadTimeout issues you saw
-        .get_updates_request_timeout(60)
-        .read_timeout(60)
-        .write_timeout(60)
+        # network T/O for getUpdates long-polling
+        .get_updates_connect_timeout(30)  # connect timeout
+        # read timeout is passed to run_polling below
         .build()
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    # Long-polling run
-    print("Bot is running (long polling)…")
-    app.run_polling(close_loop=False)
+    # run_polling has its own timeout knobs
+    app.run_polling(
+        allowed_updates=None,
+        stop_signals=None,  # Railway sends SIGTERM; PTB handles it
+        poll_interval=0.0,
+        timeout=60,         # long-poll read timeout (fix for your error)
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":

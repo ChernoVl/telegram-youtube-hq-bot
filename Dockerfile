@@ -1,27 +1,25 @@
-# Use slim Python base
+# syntax=docker/dockerfile:1
 FROM python:3.11-slim
 
-# Ensure logs flush immediately
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
-
-# Install system deps: ffmpeg (required), and basic tools
+# Install ffmpeg (needed by yt-dlp to merge video+audio)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg ca-certificates curl tini \
- && rm -rf /var/lib/apt/lists/*
+    ffmpeg ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first (better build caching)
 WORKDIR /app
+
+# Copy dependency specs first to leverage Docker layer caching
 COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN pip install --upgrade pip && \
-    pip install -r /app/requirements.txt
+# Copy app
+COPY app.py /app/app.py
 
-# Copy the rest of the app
-COPY . /app
+# Environment
+ENV PYTHONUNBUFFERED=1
 
-# Use tini as entrypoint for proper signal handling
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# Expose nothing (bot uses long polling)
+# EXPOSE 8080
 
-# Start the bot
-CMD ["python", "app.py"]
+# The bot reads BOT_TOKEN from env at runtime
+CMD ["python", "-u", "app.py"]

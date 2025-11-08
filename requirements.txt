@@ -1,2 +1,2 @@
-python-telegram-bot==20.7
-yt-dlp>=2024.12.13
+python-telegram-bot[http2]==20.8
+yt-dlp==2024.10.07
